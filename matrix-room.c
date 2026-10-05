@@ -100,6 +100,134 @@ MatrixRoomStateEventTable *matrix_room_get_state_table(
 }
 
 
+/*
+ * Returns TRUE if the room has exactly two joined members: us and one other.
+ * If other_user is non-NULL, *other_user is set to the other member's user id.
+ */
+gboolean matrix_room_is_direct(PurpleConversation *conv, const gchar **other_user)
+{
+    MatrixRoomMemberTable *members = matrix_room_get_member_table(conv);
+    MatrixConnectionData *conn = _get_connection_data_from_conversation(conv);
+    GList *member_list, *mp;
+    const gchar *other = NULL;
+    guint n = 0;
+
+    if (!members || !conn)
+        return FALSE;
+
+    member_list = matrix_roommembers_get_active_members(members, FALSE);
+    for (mp = member_list; mp; mp = g_list_next(mp)) {
+        const gchar *user_id = matrix_roommember_get_user_id(mp->data);
+        if (conn->user_id && !strcmp(user_id, conn->user_id))
+            continue;
+        other = user_id;
+        n++;
+    }
+    g_list_free(member_list);
+
+    if (n != 1)
+        return FALSE;
+    if (other_user)
+        *other_user = other;
+    return TRUE;
+}
+
+
+/*
+ * Find an existing 1:1 room with the given user, or NULL.
+ */
+PurpleConversation *matrix_room_find_direct(PurpleAccount *account,
+        const gchar *user_id)
+{
+    GList *ptr;
+
+    for (ptr = purple_get_conversations(); ptr; ptr = g_list_next(ptr)) {
+        PurpleConversation *conv = ptr->data;
+        const gchar *other = NULL;
+
+        if (conv->account != account || conv->type != PURPLE_CONV_TYPE_CHAT)
+            continue;
+        if (!matrix_room_is_direct(conv, &other))
+            continue;
+        if (other && !strcmp(other, user_id))
+            return conv;
+    }
+    return NULL;
+}
+
+
+static void _free_pending_queue(gpointer p)
+{
+    GQueue *q = p;
+    if (q)
+        g_queue_free_full(q, g_free);
+}
+
+
+/*
+ * Queue a direct message for delivery once the room with this user exists.
+ */
+void matrix_room_queue_direct(PurpleConnection *pc, const gchar *user_id,
+        const gchar *message)
+{
+    MatrixConnectionData *conn = purple_connection_get_protocol_data(pc);
+    GQueue *q;
+
+    if (!conn)
+        return;
+    if (!conn->pending_direct) {
+        conn->pending_direct = g_hash_table_new_full(g_str_hash, g_str_equal,
+                g_free, _free_pending_queue);
+    }
+    q = g_hash_table_lookup(conn->pending_direct, user_id);
+    if (!q) {
+        q = g_queue_new();
+        g_hash_table_insert(conn->pending_direct, g_strdup(user_id), q);
+    }
+    g_queue_push_tail(q, g_strdup(message));
+}
+
+
+/*
+ * Send any direct messages that were queued waiting for this room.
+ */
+void matrix_room_flush_pending_direct(PurpleConnection *pc,
+        PurpleConversation *conv)
+{
+    MatrixConnectionData *conn = purple_connection_get_protocol_data(pc);
+    MatrixRoomMemberTable *table;
+    GList *members, *mp;
+
+    if (!conn || !conn->pending_direct)
+        return;
+    table = matrix_room_get_member_table(conv);
+    if (!table)
+        return;
+
+    /* Include invited members: a freshly created direct room has the other
+     * user as "invited" until they accept, but we can still deliver to it.
+     */
+    members = matrix_roommembers_get_active_members(table, TRUE);
+    for (mp = members; mp; mp = g_list_next(mp)) {
+        const gchar *user_id = matrix_roommember_get_user_id(mp->data);
+        GQueue *q;
+
+        if (conn->user_id && !strcmp(user_id, conn->user_id))
+            continue;
+        q = g_hash_table_lookup(conn->pending_direct, user_id);
+        if (!q)
+            continue;
+        while (!g_queue_is_empty(q)) {
+            gchar *msg = g_queue_pop_head(q);
+            matrix_room_send_message(conv, msg);
+            g_free(msg);
+        }
+        g_hash_table_remove(conn->pending_direct, user_id);
+    }
+    g_list_free(members);
+}
+
+
 static guint _get_flags(PurpleConversation *conv)
 {
     return GPOINTER_TO_UINT(purple_conversation_get_data(conv,
@@ -1119,8 +1247,18 @@ void matrix_room_handle_timeline_event(PurpleConversation *conv,
     g_free(tmp_body);
     purple_debug_info("matrixprpl", "got message from %s in %s\n", sender_id,
             room_id);
-    serv_got_chat_in(conv->account->gc, g_str_hash(room_id),
-            sender_display_name, flags, escaped_body, timestamp / 1000);
+    {
+        const gchar *other_user = NULL;
+        if (matrix_room_is_direct(conv, &other_user) && other_user) {
+            /* 1:1 rooms are direct chats, which libpurple models as IMs */
+            serv_got_im(conv->account->gc, other_user, escaped_body, flags,
+                    timestamp / 1000);
+        } else {
+            serv_got_chat_in(conv->account->gc, g_str_hash(room_id),
+                    sender_display_name, flags, escaped_body,
+                    timestamp / 1000);
+        }
+    }
     g_free(escaped_body);
     if (decrypted_parser) {
         g_object_unref(decrypted_parser);

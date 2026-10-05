@@ -26,10 +26,13 @@
 
 #include <glib.h>
 
+#include <time.h>
+
 #include "account.h"
 #include "accountopt.h"
 #include "blist.h"
 #include "connection.h"
+#include "conversation.h"
 #include "debug.h"
 #include "prpl.h"
 #include "version.h"
@@ -241,7 +244,53 @@ static int matrixprpl_chat_send(PurpleConnection *gc, int id,
     }
 
     matrix_room_send_message(conv, message);
-    return 0;
+    return 1;
+}
+
+
+/**
+ * handle sending a direct message (an IM).
+ *
+ * Matrix doesn't have a separate one-to-one message API: a direct message is
+ * just a room with exactly two members. If we already have such a room we
+ * send into it; otherwise we create a direct room (per the spec, with
+ * is_direct and a trusted_private_chat preset) and deliver the message as
+ * soon as the room shows up in the next sync.
+ */
+static int matrixprpl_send_im(PurpleConnection *gc, const char *who,
+        const char *message, PurpleMessageFlags flags) {
+    PurpleAccount *account = purple_connection_get_account(gc);
+    MatrixConnectionData *conn = purple_connection_get_protocol_data(gc);
+    PurpleConversation *conv;
+    PurpleConversation *imconv;
+
+    if (!conn || who == NULL || message == NULL)
+        return -1;
+
+    conv = matrix_room_find_direct(account, who);
+    if (conv) {
+        matrix_room_send_message(conv, message);
+    } else {
+        purple_debug_info("matrixprpl",
+                "%s: no direct room with %s yet, creating one\n",
+                __func__, who);
+        matrix_room_queue_direct(gc, who, message);
+        matrix_api_create_room(conn, who, TRUE, NULL,
+                matrix_api_error, matrix_api_bad_response, NULL);
+    }
+
+    /* Echo the message to the IM conversation ourselves (libpurple relies on
+     * the prpl to show the local echo for IMs).
+     */
+    imconv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, who,
+            account);
+    if (!imconv) {
+        imconv = purple_conversation_new(PURPLE_CONV_TYPE_IM, account, who);
+    }
+    purple_conv_im_write(PURPLE_CONV_IM(imconv), who, message,
+            flags | PURPLE_MESSAGE_SEND, time(NULL));
+
+    return 1;
 }
 
 
@@ -295,7 +344,7 @@ static PurplePluginProtocolInfo prpl_info =
     matrixprpl_chat_info_defaults,         /* chat_info_defaults */
     matrixprpl_login,                      /* login */
     matrixprpl_close,                      /* close */
-    NULL,                                  /* send_im */
+    matrixprpl_send_im,                    /* send_im */
     NULL,                                  /* set_info */
     NULL,                                  /* send_typing */
     NULL,                                  /* get_info */

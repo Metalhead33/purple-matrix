@@ -46,6 +46,10 @@ typedef struct _MatrixConnectionData {
     /* All the end-2-end encryption magic */
     struct _MatrixE2EData *e2e;
 
+    /* Direct messages waiting for their room to appear: maps a user id to a
+     * GQueue of g_strdup()ed message bodies. */
+    GHashTable *pending_direct;
+
     guint check_sync_handle;
 } MatrixConnectionData;
 

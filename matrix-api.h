@@ -237,6 +237,25 @@ MatrixApiRequestData *matrix_api_join_room(MatrixConnectionData *conn,
         gpointer user_data);
 
 /**
+ * Create a room
+ *
+ * @param conn       The connection with which to make the request
+ * @param invite     User id to invite, or NULL for none
+ * @param is_direct  Whether this is a direct (one-to-one) room
+ * @param callback         Function to be called when the request completes
+ * @param error_callback   Function to be called if there is an error making
+ *                             the request.
+ * @param bad_response_callback Function to be called on a non-200 response.
+ * @param user_data        Opaque data to be passed to the callbacks
+ */
+MatrixApiRequestData *matrix_api_create_room(MatrixConnectionData *conn,
+        const gchar *invite, gboolean is_direct,
+        MatrixApiCallback callback,
+        MatrixApiErrorCallback error_callback,
+        MatrixApiBadResponseCallback bad_response_callback,
+        gpointer user_data);
+
+/**
  * Sends a typing notifiaction to a room
  *
  * @param conn             The connection with which to make the request
