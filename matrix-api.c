@@ -457,8 +457,15 @@ static GString *_build_request(PurpleAccount *acct, const gchar *url,
     g_string_append_printf(request_str, "Host: %.*s\r\n",
             (int)(url_path-url_host), url_host);
 
-    if (extra_headers != NULL)
+    if (extra_headers != NULL) {
         g_string_append(request_str, extra_headers);
+        /* Callers supply header text without the terminating CRLF; add it so
+         * that we don't glue the following header onto the end of this one.
+         */
+        if (!g_str_has_suffix(extra_headers, "\r\n") &&
+                !g_str_has_suffix(extra_headers, "\n"))
+            g_string_append(request_str, "\r\n");
+    }
     g_string_append(request_str, "Connection: close\r\n");
     g_string_append_printf(request_str, "Content-Length: %" G_GSIZE_FORMAT "\r\n",
             extra_len + (body == NULL ? 0 : strlen(body)));
@@ -813,6 +820,60 @@ MatrixApiRequestData *matrix_api_join_room(MatrixConnectionData *conn,
     fetch_data = matrix_api_start(url->str, "POST", "{}", conn, callback,
             error_callback, bad_response_callback,
             user_data, 0);
+    g_string_free(url, TRUE);
+
+    return fetch_data;
+}
+
+/* Create a room, optionally inviting a user and marking it as a direct chat.
+ * See https://spec.matrix.org/latest/client-server-api/#post_matrixclientv3createroom
+ */
+MatrixApiRequestData *matrix_api_create_room(MatrixConnectionData *conn,
+        const gchar *invite, gboolean is_direct,
+        MatrixApiCallback callback,
+        MatrixApiErrorCallback error_callback,
+        MatrixApiBadResponseCallback bad_response_callback,
+        gpointer user_data)
+{
+    GString *url;
+    MatrixApiRequestData *fetch_data;
+    JsonObject *content;
+    JsonArray *invites;
+    JsonNode *body_node;
+    JsonGenerator *generator;
+    gchar *json;
+
+    url = g_string_new(conn->homeserver);
+    g_string_append(url, "_matrix/client/r0/createRoom?access_token=");
+    g_string_append(url, purple_url_encode(conn->access_token));
+
+    content = json_object_new();
+    invites = json_array_new();
+    if (invite != NULL) {
+        json_array_add_string_element(invites, invite);
+    }
+    json_object_set_array_member(content, "invite", invites);
+    json_object_set_boolean_member(content, "is_direct", is_direct);
+    /* trusted_private_chat makes the invited user a joined member and gives
+     * them the same power level as us, which is what a DM should be.
+     */
+    json_object_set_string_member(content, "preset", "trusted_private_chat");
+
+    body_node = json_node_new(JSON_NODE_OBJECT);
+    json_node_set_object(body_node, content);
+    generator = json_generator_new();
+    json_generator_set_root(generator, body_node);
+    json = json_generator_to_data(generator, NULL);
+    g_object_unref(G_OBJECT(generator));
+    json_node_free(body_node);
+    json_object_unref(content);
+
+    purple_debug_info("matrixprpl", "creating room (invite=%s is_direct=%d)\n",
+            invite ? invite : "(none)", is_direct);
+
+    fetch_data = matrix_api_start(url->str, "POST", json, conn, callback,
+            error_callback, bad_response_callback, user_data, 0);
+    g_free(json);
     g_string_free(url, TRUE);
 
     return fetch_data;

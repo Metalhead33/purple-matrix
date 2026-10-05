@@ -153,6 +153,10 @@ static void matrix_sync_room(const gchar *room_id,
 
     matrix_room_complete_state_update(conv, !initial_sync);
 
+    /* Now that we know who is in the room, deliver any direct messages that
+     * were queued waiting for this room to be created. */
+    matrix_room_flush_pending_direct(pc, conv);
+
     /* parse the ephemeral events */
     /* (uses the state table to track the state of who is typing and who isn't) */
     ephemeral_object = matrix_json_object_get_object_member(room_data, "ephemeral");

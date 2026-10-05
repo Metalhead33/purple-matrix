@@ -36,6 +36,7 @@
 
 struct _PurpleConversation;
 struct _PurpleConnection;
+struct _PurpleAccount;
 
 /**
  * @param conv   conversation info
@@ -90,6 +91,31 @@ void matrix_room_send_message(struct _PurpleConversation *conv,
 MatrixRoomStateEventTable *matrix_room_get_state_table(
         struct _PurpleConversation *conv);
 MatrixRoomMemberTable *matrix_room_get_member_table(
+        struct _PurpleConversation *conv);
+
+/**
+ * Returns TRUE if the room is a 1:1 (direct) chat; if so and other_user is
+ * non-NULL, *other_user is set to the other member's user id.
+ */
+gboolean matrix_room_is_direct(struct _PurpleConversation *conv,
+        const gchar **other_user);
+
+/**
+ * Find an existing 1:1 room with the given user, or NULL.
+ */
+struct _PurpleConversation *matrix_room_find_direct(struct _PurpleAccount *account,
+        const gchar *user_id);
+
+/**
+ * Queue a direct message for delivery once the room with this user exists.
+ */
+void matrix_room_queue_direct(struct _PurpleConnection *pc,
+        const gchar *user_id, const gchar *message);
+
+/**
+ * Send any direct messages that were queued waiting for this room.
+ */
+void matrix_room_flush_pending_direct(struct _PurpleConnection *pc,
         struct _PurpleConversation *conv);
 
 

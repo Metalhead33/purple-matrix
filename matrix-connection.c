@@ -62,6 +62,11 @@ void matrix_connection_free(PurpleConnection *pc)
 
     conn->syncRun = FALSE;
 
+    if (conn->pending_direct) {
+        g_hash_table_destroy(conn->pending_direct);
+        conn->pending_direct = NULL;
+    }
+
     matrix_e2e_cleanup_connection(conn);
     purple_connection_set_protocol_data(pc, NULL);
 
