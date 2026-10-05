@@ -1287,24 +1287,30 @@ static MatrixOlmSession *find_olm_session(MatrixConnectionData *conn,
     while (cur_entry) {
         if (!strcmp(sender_id, cur_entry->sender_id) &&
             !strcmp(sender_key, cur_entry->sender_key)) {
-            size_t ret;
-            char *body_double = g_strdup(body);
             have_sender = TRUE;
-            ret = olm_matches_inbound_session(cur_entry->session, body_double,
-                                              strlen(body));
-            g_free(body_double);
-            if (ret == 1) {
-                purple_debug_info("matrixprpl",
-                                  "%s: Found matching session for %s/%s\n",
-                                  __func__, sender_id, sender_key);
-                return cur_entry;
-            }
-            if (ret == olm_error()) {
-                purple_debug_warning("matrixprpl",
-                        "%s: Error while checking session %p for "
-                        "match with %s/%s: %s\n", __func__, cur_entry->session,
-                        sender_id, sender_key,
-                        olm_session_last_error(cur_entry->session));
+            /* An empty body means "just make sure everything is loaded"; it
+             * is used when the caller doesn't know which session a normal
+             * olm message belongs to (those don't identify their session).
+             */
+            if (body && body[0]) {
+                size_t ret;
+                char *body_double = g_strdup(body);
+                ret = olm_matches_inbound_session(cur_entry->session,
+                                                  body_double, strlen(body));
+                g_free(body_double);
+                if (ret == 1) {
+                    purple_debug_info("matrixprpl",
+                                      "%s: Found matching session for %s/%s\n",
+                                      __func__, sender_id, sender_key);
+                    return cur_entry;
+                }
+                if (ret == olm_error()) {
+                    purple_debug_warning("matrixprpl",
+                            "%s: Error while checking session %p for "
+                            "match with %s/%s: %s\n", __func__,
+                            cur_entry->session, sender_id, sender_key,
+                            olm_session_last_error(cur_entry->session));
+                }
             }
         }
         cur_entry = cur_entry->next;
@@ -1371,8 +1377,12 @@ static MatrixOlmSession *find_olm_session(MatrixConnectionData *conn,
             cur_entry->session = session;
             cur_entry->unique = sqlite3_column_int64(dbstmt, 1);
             *chain = cur_entry;
+            /* Advance the pointer so the next loaded session is appended
+             * rather than replacing this one.
+             */
+            chain = &(cur_entry->next);
 
-            if (!result) {
+            if (!result && body && body[0]) {
                 char *body_double = g_strdup(body);
                 /* But is this the session we're after ? */
                 ret = olm_matches_inbound_session(session,
@@ -2030,6 +2040,69 @@ static int ensure_table(MatrixConnectionData *conn, const char *check, const cha
 
     return 0;
 }
+
+/* Older versions of the plugin created the olmsessions table with a primary
+ * key on (sender_name, sender_key), which only permits a single olm session
+ * per device. Rebuild the table (preserving existing rows) if we find that
+ * old schema so that multiple sessions can be stored.
+ * Returns 0 on success (including "nothing to do"), -1 on error.
+ */
+static int migrate_e2e_db(MatrixConnectionData *conn)
+{
+    PurpleConnection *pc = conn->pc;
+    sqlite3_stmt *dbstmt = NULL;
+    gboolean has_id_column = FALSE;
+    const char *inspect = "PRAGMA table_info(olmsessions)";
+    const char *migrate =
+        "BEGIN;"
+        "CREATE TABLE olmsessions_new ("
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    sender_name text, sender_key text, session_pickle text);"
+        "INSERT INTO olmsessions_new (sender_name, sender_key, session_pickle)"
+        "    SELECT sender_name, sender_key, session_pickle FROM olmsessions;"
+        "DROP TABLE olmsessions;"
+        "ALTER TABLE olmsessions_new RENAME TO olmsessions;"
+        "COMMIT;";
+    gchar *errmsg = NULL;
+    int ret;
+
+    ret = sqlite3_prepare_v2(conn->e2e->db, inspect, -1, &dbstmt, NULL);
+    if (ret != SQLITE_OK || !dbstmt) {
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to inspect e2e db sessions table");
+        return -1;
+    }
+    while (sqlite3_step(dbstmt) == SQLITE_ROW) {
+        /* Column 1 of PRAGMA table_info is the column name */
+        const gchar *name = (const gchar *)sqlite3_column_text(dbstmt, 1);
+        if (name && !strcmp(name, "id")) {
+            has_id_column = TRUE;
+            break;
+        }
+    }
+    sqlite3_finalize(dbstmt);
+
+    if (has_id_column) {
+        /* Already using the new schema */
+        return 0;
+    }
+
+    purple_debug_info("matrixprpl",
+            "%s: migrating olmsessions to multi-session schema\n", __func__);
+
+    ret = sqlite3_exec(conn->e2e->db, migrate, NULL, NULL, &errmsg);
+    if (ret != SQLITE_OK) {
+        purple_debug_warning("matrixprpl", "%s: migration failed: %s\n",
+                __func__, errmsg ? errmsg : "(unknown)");
+        sqlite3_exec(conn->e2e->db, "ROLLBACK;", NULL, NULL, NULL);
+        sqlite3_free(errmsg);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int open_e2e_db(MatrixConnectionData *conn)
 {
     PurpleConnection *pc = conn->pc;
@@ -2054,10 +2127,23 @@ static int open_e2e_db(MatrixConnectionData *conn)
 
     ret = ensure_table(conn,
                  "SELECT name FROM sqlite_master WHERE type='table' AND name='olmsessions'",
-                 "CREATE TABLE olmsessions (sender_name text, sender_key text,"
-                 "                          session_pickle text,"
-                 "                          PRIMARY KEY (sender_name, sender_key))");
+                 /* Use an auto-increment rowid rather than a primary key on
+                  * (sender_name, sender_key): a peer may create a new olm
+                  * session for us at any time (e.g. when it rotates) and we
+                  * need to be able to remember more than one session per
+                  * device.
+                  */
+                 "CREATE TABLE olmsessions ("
+                 "                          id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "                          sender_name text, sender_key text,"
+                 "                          session_pickle text)");
 
+    if (ret) {
+        close_e2e_db(conn);
+        return ret;
+    }
+
+    ret = migrate_e2e_db(conn);
     if (ret) {
         close_e2e_db(conn);
         return ret;
@@ -2531,8 +2617,77 @@ static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonOb
         update_olm_session(conn, mos);
         plaintext[pt_len] = '\0';
         handle_decrypted_olm(pc, conn, cevent_sender, sender_key, plaintext);
+    } else if (type == 1) {
+        /* A normal olm message sent over a session we already have. Unlike
+         * prekey messages, normal messages don't identify which session they
+         * were sent with, so try each session we hold for this sender until
+         * one decrypts it. Trying a session that doesn't own the message is
+         * safe: libolm fails on the ratchet key lookup without changing it.
+         */
+        const gchar *cevent_body;
+        MatrixOlmSession *candidate;
+
+        cevent_body = matrix_json_object_get_string_member(our_ciphertext,
+                                                           "body");
+        if (!cevent_body) {
+            purple_debug_info("matrixprpl", "%s: No body in olm message\n",
+                              __func__);
+            goto err;
+        }
+
+        candidate = get_any_olm_session(conn, cevent_sender, sender_key);
+        for (; candidate; candidate = candidate->next) {
+            size_t candidate_max;
+            size_t pt_len;
+
+            cevent_body_copy = g_strdup(cevent_body);
+            candidate_max = olm_decrypt_max_plaintext_length(
+                    candidate->session, 1 /* Normal message */,
+                    cevent_body_copy, strlen(cevent_body_copy));
+            g_free(cevent_body_copy);
+            cevent_body_copy = NULL;
+            if (candidate_max == olm_error()) {
+                /* Not the session this message belongs to - try the next */
+                continue;
+            }
+
+            plaintext = g_malloc0(candidate_max + 1);
+            cevent_body_copy = g_strdup(cevent_body);
+            pt_len = olm_decrypt(candidate->session, 1 /* Normal message */,
+                                 cevent_body_copy, strlen(cevent_body),
+                                 plaintext, candidate_max);
+            g_free(cevent_body_copy);
+            cevent_body_copy = NULL;
+            if (pt_len == olm_error() || pt_len >= candidate_max) {
+                purple_debug_info("matrixprpl",
+                        "%s: Session %p didn't decrypt message from %s: %s\n",
+                        __func__, candidate->session, cevent_sender,
+                        olm_session_last_error(candidate->session));
+                clear_mem(plaintext, candidate_max);
+                g_free(plaintext);
+                plaintext = NULL;
+                continue;
+            }
+
+            /* Found the session this message belongs to */
+            max_plaintext_len = candidate_max;
+            plaintext[pt_len] = '\0';
+            update_olm_session(conn, candidate);
+            purple_debug_info("matrixprpl",
+                    "%s: Decrypted normal olm message from %s\n",
+                    __func__, cevent_sender);
+            handle_decrypted_olm(pc, conn, cevent_sender, sender_key,
+                                 plaintext);
+            break;
+        }
+        if (!plaintext) {
+            purple_debug_info("matrixprpl",
+                    "%s: No session matched normal olm message from %s\n",
+                    __func__, cevent_sender);
+        }
     } else {
-        purple_debug_info("matrixprpl", "%s: Type %zd olm\n", __func__, type);
+        purple_debug_info("matrixprpl", "%s: Unknown olm message type %zd\n",
+                          __func__, type);
     }
     if (plaintext) {
         clear_mem(plaintext, max_plaintext_len);
