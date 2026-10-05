@@ -2499,6 +2499,95 @@ out:
     return ret;
 }
 
+/* Restore a session to a previously taken pickle, undoing any state change
+ * that a failed decrypt attempt might have made. `pickle` must have come from
+ * olm_pickle_session() on this session.
+ */
+static void olm_restore_session(OlmSession *session, const gchar *pickle,
+        size_t pickle_len)
+{
+    gchar *restore = g_strdup(pickle);
+    olm_clear_session(session);
+    if (olm_unpickle_session(session, "!", 1, restore, pickle_len) ==
+            olm_error()) {
+        purple_debug_warning("matrixprpl",
+                "%s: Failed to restore session: %s\n", __func__,
+                olm_session_last_error(session));
+    }
+    clear_mem(restore, pickle_len);
+    g_free(restore);
+}
+
+/* Try to decrypt a normal (type 1) olm message with the given session.
+ *
+ * We cannot tell up-front whether a normal message belongs to a particular
+ * session (unlike prekey messages, they don't identify it), so the caller may
+ * have to try several. To make that safe we take a pickle of the session
+ * first and restore it if the attempt fails, so a session that doesn't own
+ * the message is left exactly as it was.
+ *
+ * Returns a newly allocated NUL-terminated plaintext (and advances the
+ * session) on success, or NULL on failure (leaving the session unchanged).
+ */
+static gchar *olm_try_decrypt_normal(OlmSession *session, const gchar *body,
+        size_t *plaintext_length)
+{
+    size_t pickle_alloc_len;
+    size_t pickle_len;
+    gchar *pickle;
+    gchar *body_copy;
+    gchar *plaintext;
+    size_t max_len;
+    size_t pt_len;
+
+    pickle_alloc_len = olm_pickle_session_length(session);
+    pickle = g_malloc(pickle_alloc_len + 1);
+    pickle_len = olm_pickle_session(session, "!", 1, pickle,
+            pickle_alloc_len);
+    if (pickle_len == olm_error()) {
+        purple_debug_warning("matrixprpl",
+                "%s: Failed to pickle session: %s\n", __func__,
+                olm_session_last_error(session));
+        g_free(pickle);
+        return NULL;
+    }
+    pickle[pickle_len] = '\0';
+
+    body_copy = g_strdup(body);
+    max_len = olm_decrypt_max_plaintext_length(session, 1, body_copy,
+            strlen(body_copy));
+    g_free(body_copy);
+    if (max_len == olm_error()) {
+        olm_restore_session(session, pickle, pickle_len);
+        clear_mem(pickle, pickle_len);
+        g_free(pickle);
+        return NULL;
+    }
+
+    plaintext = g_malloc0(max_len + 1);
+    body_copy = g_strdup(body);
+    pt_len = olm_decrypt(session, 1, body_copy, strlen(body_copy),
+            plaintext, max_len);
+    g_free(body_copy);
+    if (pt_len == olm_error() || pt_len >= max_len) {
+        purple_debug_info("matrixprpl",
+                "%s: Session %p didn't decrypt message: %s\n", __func__,
+                session, olm_session_last_error(session));
+        olm_restore_session(session, pickle, pickle_len);
+        clear_mem(plaintext, max_len);
+        g_free(plaintext);
+        clear_mem(pickle, pickle_len);
+        g_free(pickle);
+        return NULL;
+    }
+
+    clear_mem(pickle, pickle_len);
+    g_free(pickle);
+    plaintext[pt_len] = '\0';
+    *plaintext_length = pt_len;
+    return plaintext;
+}
+
 /*
  * See:
  * https://matrix.org/docs/guides/e2e_implementation.html#m-olm-v1-curve25519-aes-sha2
@@ -2621,8 +2710,9 @@ static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonOb
         /* A normal olm message sent over a session we already have. Unlike
          * prekey messages, normal messages don't identify which session they
          * were sent with, so try each session we hold for this sender until
-         * one decrypts it. Trying a session that doesn't own the message is
-         * safe: libolm fails on the ratchet key lookup without changing it.
+         * one decrypts it. olm_try_decrypt_normal() pickles and, on failure,
+         * restores the session around each attempt, so a session which
+         * doesn't own the message is left exactly as it was.
          */
         const gchar *cevent_body;
         MatrixOlmSession *candidate;
@@ -2637,41 +2727,17 @@ static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonOb
 
         candidate = get_any_olm_session(conn, cevent_sender, sender_key);
         for (; candidate; candidate = candidate->next) {
-            size_t candidate_max;
-            size_t pt_len;
+            size_t candidate_len = 0;
 
-            cevent_body_copy = g_strdup(cevent_body);
-            candidate_max = olm_decrypt_max_plaintext_length(
-                    candidate->session, 1 /* Normal message */,
-                    cevent_body_copy, strlen(cevent_body_copy));
-            g_free(cevent_body_copy);
-            cevent_body_copy = NULL;
-            if (candidate_max == olm_error()) {
+            plaintext = olm_try_decrypt_normal(candidate->session,
+                                               cevent_body, &candidate_len);
+            if (!plaintext) {
                 /* Not the session this message belongs to - try the next */
                 continue;
             }
 
-            plaintext = g_malloc0(candidate_max + 1);
-            cevent_body_copy = g_strdup(cevent_body);
-            pt_len = olm_decrypt(candidate->session, 1 /* Normal message */,
-                                 cevent_body_copy, strlen(cevent_body),
-                                 plaintext, candidate_max);
-            g_free(cevent_body_copy);
-            cevent_body_copy = NULL;
-            if (pt_len == olm_error() || pt_len >= candidate_max) {
-                purple_debug_info("matrixprpl",
-                        "%s: Session %p didn't decrypt message from %s: %s\n",
-                        __func__, candidate->session, cevent_sender,
-                        olm_session_last_error(candidate->session));
-                clear_mem(plaintext, candidate_max);
-                g_free(plaintext);
-                plaintext = NULL;
-                continue;
-            }
-
             /* Found the session this message belongs to */
-            max_plaintext_len = candidate_max;
-            plaintext[pt_len] = '\0';
+            max_plaintext_len = candidate_len;
             update_olm_session(conn, candidate);
             purple_debug_info("matrixprpl",
                     "%s: Decrypted normal olm message from %s\n",
